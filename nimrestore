@@ -1,0 +1,230 @@
+#!/bin/sh
+#
+# This script is used to restore mksysb images from
+# the AIX servers onto a test system
+#
+# Notes
+#
+# It is CRITCAL that you only restore these images to your test server.
+# This could cause you a great deal of pain if you are not careful.
+#
+# !!!!!!!!     WARNING     !!!!!!!!!!!
+# !!!!!!!!   * WARNING *   !!!!!!!!!!!
+# !!!!!!!!  ** WARNING **  !!!!!!!!!!!
+
+# Changing the value of the $TESTHOST could really screw you up.
+# This is the host that NIM will use to restore a system.
+# That means that ANYTHING on this server will be deleted!!!!
+
+TESTHOST="my-host-to-restore-to"
+logbase="/var/log/nimlogs"
+# Include path to this script
+PATH=/usr/sbin:$PATH
+
+# !!!!!!!! END  WARNING     !!!!!!!!!!!
+
+# Set some variables
+globalRC=0
+basename=`basename $0`
+hostname=`/bin/hostname`
+
+mailx="/usr/bin/mailx"
+subject="NIM Restore: "
+email="admin@example.com"
+
+# Don't start a restore if it's in or after this hour.
+maxStartHour="16"  
+
+ldate=`/bin/date +"%Y-%m-%d"`
+ltime="$ldate `/bin/date +"%T"`"
+logfile="$logbase/$basename.log.$ldate"
+
+Usage() {
+
+  1>&2 echo "
+ Usage:  `basename $0` [-n] [-h] \"<hostname(s)>\"
+
+ Recognized keywords and their functions:
+
+ -h	list a host or hosts (use double quotes) that you want to run this script against. 
+	You can use multiple -h flags if you do not want to use double quotes.
+ -n  	turns on debugging and doesn't actually run any backup commands.
+ -s	pass a site to the hosts command
+ -u	this usage message
+
+ examples:
+
+ Either of these two commands will restore a mksysb image from two machines.
+	`basename $0` -h \"host1 host2\"
+	`basename $0` -h host1 -h host2
+
+   "
+}
+
+Message() {
+	ldate=`/bin/date +"%Y-%m-%d"`
+	ltime="$ldate `/bin/date +"%T"`"
+        echo $ltime $1 >> $logfile
+} 
+
+EmailMessage() {
+  globalRC=`grep -c RC=1 $logfile`
+  Message "$basename ended. Total Errors=$globalRC"
+  if [ $globalRC -gt 0 ]
+  then
+    # cat $logfile  |$mailx -s "$subject" $email
+	echo ""
+  fi
+}
+
+Die() {
+        exit 1
+}
+
+AmIReadyToRun() {
+
+ # This function will always receive the TESTHOST variable as an argument.
+ # So, this host could be hard coded but for flexibility I coded it this way
+
+ tmpMaxStartHour=`/bin/date +"%H"`
+ curClient=$1
+ localExit=0
+ if [ $curClient"x" = "x" ]
+ then
+    Message "Didn't retrieve passed variable to AmIReadyToRun function. RC=1"
+    EmailMessage
+    Die
+ fi
+  
+ tmpMaxStartHour=`/bin/date +"%H"`
+ if [ $tmpMaxStartHour -ge $maxStartHour ]
+ then
+   Message "It's too late in the day to start a restore. RC=1"
+   localExit=1
+   return
+ fi
+
+ #Does the server respond to a ping?
+ ping -c 1 $curClient >/dev/null
+ RC=`echo $?`
+ if [ $RC != 0 ] 
+ then
+    Message "$curClient is not pingable. RC=1"
+    localExit=1
+    return
+ fi 
+ #Can we communicate to the client via nimsh?
+ nim -o lslpp $curClient > /dev/null
+ RC=`echo $?`
+ if [ $RC != 0 ]
+ then
+   Message "nimsh is not configured on $curClient. RC=1"
+   localExit=1
+   return
+ fi 
+ 
+
+  
+
+}
+
+StartTheMksysbRestore() {
+  echo $curClient
+  curClient=$1
+  curOS=`lsnim -l ${curClient}-spot|grep oslevel_r | cut -c 20,21`
+  case $curOS in
+     52)
+	lppName="AIX-5-2-TL10-SP1-lpp-source"
+	;;
+     53)
+	lppName="AIX-5-3-TL10-SP0-lpp-source"
+	;;
+     61)
+	lppName="AIX-6-1-TL1-SP3-lpp-source"
+ 	;;
+   esac
+
+  #Verify that we have a valid lppName
+  if [ $lppName"x" = "x" ]
+  then
+    Message "No lppsource returned. RC=1"
+    EmailMessage
+    Die
+  fi
+
+  # Get the NIM command all set up and rady to go.
+  aCommand="nim -o bos_inst \
+	-a source=mksysb \
+    	-a debug=yes \
+	-a lpp_source=$lppName \
+	-a spot=${curClient}-spot \
+	-a mksysb=${curClient}-mksysb \
+	-a accept_licenses=yes \
+	-a bosinst_data=bid_ow \
+        -a fb_script=PostInstallScript_TESTING \
+	$TESTHOST"
+
+  echo $aCommand
+  echo "WE ARE STOPPING THE SCRIPT NOW. NO COMMAND WAS EXECUTED"
+  exit
+  #Here we go!
+  if [ "$DEBUG"x = x ]
+  then
+   # Let's echo this command to the log file
+   echo $aCommand >> $logfile
+   echo "++++++++++++++++++++++++++++++++++++++++++++++++++++" >> $logfile
+   Message "++++ $curClient ++++"
+   echo "++++++++++++++++++++++++++++++++++++++++++++++++++++" >> $logfile
+ 
+   # Now we will run the command.
+   $aCommand >> $logfile 2>&1 
+   RC=`echo $?`
+  else
+   echo $aCommand >> $logfile
+   RC=`echo $?`
+  fi
+
+  localMksysbExit=$RC
+}
+
+
+
+
+#
+##########################
+##         MAIN         ##
+##########################
+
+DEBUG=""
+set -o noglob
+Message "$basename started w/ arguments: $*"
+set +o noglob
+
+while getopts "h:ns:u" optionName
+do
+  case "$optionName" in
+    h)
+	HostList="$HostList $OPTARG"
+	;;
+    n)  
+        DEBUG="echo"
+        ;;
+    u)
+	Usage
+	exit 0 
+	;;
+  esac
+done
+
+for curHost in $HostList
+do
+  AmIReadyToRun $TESTHOST
+  if [ $localExit -eq 0 ]
+  then
+    StartTheMksysbRestore $curHost
+  fi
+done
+
+#We'll log that we have finished this script. We'll email the log if we
+# have any errors in it.
+EmailMessage

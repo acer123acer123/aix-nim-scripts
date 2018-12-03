@@ -1,0 +1,251 @@
+#!/bin/sh
+#
+# This script is used to create mksysb images from
+# the AIX servers. 
+#
+# Revision history:
+#
+# Client Setup
+#
+# To use this script you need to have nimsh installed
+# and configured on your client machine.
+# You can also create an /etc/exclude.rootvg file on that machine
+# to exclude files and directories from being backed up.
+#
+# See the nim documentation for information on how to setup and
+# configure a nim client.
+
+# Set some variables
+globalRC=0
+basename=`basename $0`
+hostname=`/bin/hostname`
+
+MksysbLocation="/nimfs/mksysb"
+mailx="/usr/bin/mailx"
+subject="NIM mksysb backups"
+email="admin@example.com"
+logbase="/var/log/nimlogs"
+# Include path to this script
+PATH=/usr/sbin:$PATH
+
+ldate=`/bin/date +"%Y-%m-%d"`
+ltime="$ldate `/bin/date +"%T"`"
+
+Usage() {
+
+  1>&2 echo "
+ Usage:  `basename $0` [-n] [-h] \"<hostname(s)>\" 
+
+ Recognized keywords and their functions:
+
+ -h	list a host or hosts (use double quotes) that you want to run this script against. 
+	You can use multiple -h flags if you do not want to use double quotes.
+ -n  	turns on debugging and doesn't actually run any backup commands.
+ -u	this usage message
+
+ You can combine the -h and -s flags and you can have multiple instances of each.
+
+ examples:
+
+ Either of these two commands will collect a mksysb image from two machines.
+	`basename $0` -h \"host1 host2\"
+	`basename $0` -h host1 -h host2 
+   "
+}
+
+Message() {
+	ldate=`/bin/date +"%Y-%m-%d"`
+	ltime="$ldate `/bin/date +"%T"`"
+        echo $ltime $1 >> $logfile
+} 
+
+EmailMessage() {
+  globalRC=`grep -c RC=1 $logfile`
+  Message "$basename ended. Total Errors=$globalRC"
+  if [ $globalRC -gt 0 ]
+  then
+    cat $logfile |$mailx -s "$subject" $email
+  fi
+}
+
+Die() {
+        exit 1
+}
+
+AmIReadyToRun() {
+
+ curClient=$1
+ localExit=0
+ if [ $curClient"x" = "x" ]
+ then
+    Message "Didn't retrieve passed variable to AmIReadyToRun function. RC=1"
+    EmailMessage
+    Die
+ fi
+
+ #Does the server respond to a ping?
+ ping -c 1 $curClient >/dev/null
+ RC=`echo $?`
+ if [ $RC != 0 ]
+ then
+    Message "$curClient is not pingable. RC=1"
+    localExit=1
+ fi 
+ #Can we communicate to the client via nimsh?
+ nim -o lslpp $curClient > /dev/null
+ RC=`echo $?`
+ if [ $RC != 0 ]
+ then
+    Message "nimsh is not configured on $curClient. RC=1"
+    localExit=1
+ fi 
+
+ [ ! -d $MksysbLocation/$curClient ] && mkdir $MksysbLocation/$curClient
+
+
+}
+
+RemoveNIMResource() {
+  nimResource=$1
+  # We must first remove the object in the NIM database
+   nim -o remove $nimResource  >> $logfile 2>&1
+   RC=`echo $?`
+   if [ $RC -ne 0 ]
+   then
+      Message "Problem removing $nimResource for $curClient. Will try to continue."
+   fi
+}
+StartTheMksysbBackup() {
+
+  curClient=$1
+
+  # Get the NIM command all set up and rady to go.
+  aCommand="nim -o define -t mksysb -aserver=master -amk_image=yes \
+	-a mksysb_flags=eip	\
+	-alocation=$MksysbLocation/$curClient/mksysb \
+	-asource=$curClient $curClient-mksysb"
+ 
+  #Here we go!
+  if [ "$DEBUG"x = x ]
+  then
+   # Let's echo this command to the log file
+   echo $aCommand >> $logfile
+   # Let's move the old mksysb files out of the way. We'll keep 3 of them.
+   for i in 3 2 1
+   do
+     let aNew=$i+1
+     if [ -f $MksysbLocation/$curClient/mksysb.$i ]
+     then
+	mv $MksysbLocation/$curClient/mksysb.$i $MksysbLocation/$curClient/mksysb.$aNew
+     fi
+   done
+   if [ -f $MksysbLocation/$curClient/mksysb.4 ]
+   then
+	rm $MksysbLocation/$curClient/mksysb.4
+   fi
+   if [ -f $MksysbLocation/$curClient/mksysb ]
+   then
+	mv $MksysbLocation/$curClient/mksysb $MksysbLocation/$curClient/mksysb.1
+   fi
+   echo "++++++++++++++++++++++++++++++++++++++++++++++++++++" >> $logfile
+   Message "++++ $curClient ++++"
+   echo "++++++++++++++++++++++++++++++++++++++++++++++++++++" >> $logfile
+   # We must first remove the object in the NIM database
+   
+   #We have to remove the SPOT resource before we can remove the mksysb one.
+   RemoveNIMResource $curClient-spot
+   RemoveNIMResource $curClient-mksysb
+
+   # Now we will run the command.
+   $aCommand >> $logfile 2>&1 
+   RC=`echo $?`
+  else
+   echo $aCommand >> $logfile
+   RC=`echo $?`
+  fi
+
+  if [ $RC != 0 ]
+  then
+   Message "nim mksysb for $curClient failed. See messages above. RC=1"
+  else
+   Message "nim mksysb for $curClient ended successfully. RC=0"
+  fi
+
+  localMksysbExit=$RC
+}
+
+
+StartTheSPOTBackup() {
+  curClient=$1
+  # Get the NIM command all set up and rady to go.
+  aCommand="nim -o define -t spot -a server=master \
+        -a location=$MksysbLocation/$curClient \
+        -a source=$curClient-mksysb $curClient-spot"
+
+ #Here we go!
+  if [ "$DEBUG"x = x ]
+  then
+   # Run the command.
+   $aCommand >> $logfile 2>&1 
+   RC=`echo $?`
+  else
+   echo $aCommand >> $logfile
+   RC=`echo $?`
+  fi
+ 
+  if [ $RC != 0 ]
+  then
+   Message "nim SPOT for $curClient failed. See messages above. RC=1"
+  else
+   Message "nim SPOT for $curClient ended successfully. RC=0"
+  fi
+}
+
+
+
+
+
+#
+##########################
+##         MAIN         ##
+##########################
+
+
+DEBUG=""
+
+while getopts "h:ns:u" optionName
+do
+  case "$optionName" in
+    h)
+	HostList="$HostList $OPTARG"
+	;;
+    n)  
+        DEBUG="echo"
+        ;;
+    u)
+	Usage
+	exit 0 
+	;;
+  esac
+done
+
+for curHost in $HostList
+do
+  logfile="$logbase/$basename.$curHost.$ldate.log"
+  AmIReadyToRun $curHost
+  if [ $localExit -eq 0 ]
+  then
+    export INST_DEBUG=yes
+    StartTheMksysbBackup $curHost
+    if [ $localMksysbExit -eq 0 ]
+    then
+	StartTheSPOTBackup $curHost
+    else
+	Message "Not creating SPOT for $i because Mksysb failed. RC=1"
+    fi 
+  fi
+done
+
+#We'll log that we have finished this script. We'll email the log if we
+# have any errors in it.
+EmailMessage
